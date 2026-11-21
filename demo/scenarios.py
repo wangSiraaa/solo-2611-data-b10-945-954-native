@@ -11,7 +11,9 @@
 3. 新预算不足被拒绝（组织新产品照发，预算仓继续绑旧版）；
 4. 支出后部分取消（实际支出不撤销，只释放剩余占额）；
 5. 并发承诺争额度（最多一方成功）与同请求重试不二次占额；
-6. 大规模场景：20 部门 / 深度 5 / 100 笔支出，独立重算 + 事件级审计。
+6. 大规模场景：20 部门 / 深度 5 / 100 笔支出，独立重算 + 事件级审计；
+7. 采购合同验收 / 退货应付单（floor 确认价、旧库实付只扣一次、版本可重开）
+   与最小费用出纳排程（迟费 + 信用费，含两合同争同日余额与无解判定）。
 """
 
 from __future__ import annotations
@@ -24,7 +26,9 @@ from pathlib import Path
 from orgbudget import BudgetService, OrgService
 from orgbudget.audit import audit_scheme, independent_allocate
 from orgbudget.budget import WeightedChild, allocate_children
-from orgbudget.errors import CommitmentClosedError, InsufficientFunds
+from orgbudget.contract_service import ContractService
+from orgbudget.errors import CommitmentClosedError, InfeasibleSchedule, InsufficientFunds
+from orgbudget.payment import Bill, schedule_payments
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "demo_data"
 
@@ -284,6 +288,121 @@ def main() -> None:
     _check("换版后事件级审计通过", audit2.spend_events == 100
            and audit2.total_spent == audit1.total_spent)
     _check("旧方案仍按旧树审计通过", audit_old.org_version == bv1)
+
+    # ------------------------------------------------------------ 7. 合同应付与出纳排程
+    _line("案例 7：采购合同验收 / 退货应付单与最小费用出纳排程")
+    pay_org = OrgService(DATA_DIR / "pay_org.db")
+    pay_budget = BudgetService(DATA_DIR / "pay_budget.db", pay_org)
+    pay_org.create_department("HQ", None)
+    pay_org.create_department("YE", "HQ")  # 叶部门
+    pv1 = pay_org.publish("采购组织初始树").version
+    pp1 = pay_org.get_product(pv1)
+    pw = {(d, k): 1 for d in pp1.department_ids for k in pp1.children(d)}
+    pay_budget.register_root_budget(pv1, 100_000, pw)
+
+    # 真实采购承诺 10（占额），旧库已真实实付 2（入账）。
+    pay_budget.create_commitment("REQ-A", "YE", 10)
+    pay_budget.register_spend("REQ-A", 2, "PAY-SP-1")
+    contracts = ContractService(DATA_DIR / "contract.db", pay_budget)
+    # 新合同只绑这一个真实承诺；总价即承诺额 10，共 3 件，窗口第 1~2 天。
+    contracts.create_contract(
+        "CT-A", "REQ-A", total_qty=3, supplier_id="供应商A",
+        earliest_day=1, latest_day=2, preferred_day=1, late_fee=4,
+    )
+    contracts.register_receipt("CT-A", "GRN-1", 2)  # 先验收两件
+
+    def bill_of(statement):
+        c = contracts.get_contract(statement.contract_id)
+        return Bill(statement.contract_id, statement.payable_amount,
+                    c.earliest_day, c.latest_day, c.preferred_day, c.late_fee)
+
+    st = contracts.build_payable_statement("CT-A")
+    print(f"  验收两件、无退货：净验收 {st.net_qty}，确认价 floor(10×2/3)={st.confirmed_price}，"
+          f"旧库实付 {st.old_spent}，应付 {st.payable_amount}（应付单 v{st.version_no}）")
+    _check("题面应付 = 4", st.payable_amount == 4)
+    _check("应付单留痕所用交货/退货/实付",
+           len(st.receipts) == 1 and len(st.returns) == 0 and len(st.spend_events) == 1)
+
+    def run_case(title, *, credit_limit, credit_rate, initial=1, deposits=None):
+        sched = schedule_payments(
+            [bill_of(contracts.latest_statement("CT-A"))],
+            horizon_days=2, initial_cash=initial,
+            deposits=deposits or {2: 3},
+            credit_limit=credit_limit, credit_rate=credit_rate,
+        )
+        print(f"  {title}: 付款日 {sched.bill_pay_days}，迟费 {sched.total_late_fee}，"
+              f"信用费 {sched.total_credit_fee}，总费用 {sched.total_fee}")
+        for lg in sched.ledgers:
+            print(f"    第{lg.day}天 开账{lg.opening_cash} 入款{lg.deposit} "
+                  f"付款{lg.paid_amount}{lg.paid_bill_ids} 结尾{lg.closing_balance}")
+        return sched
+
+    s1 = run_case("额度3/费率1（当天借3比延期费4便宜）", credit_limit=3, credit_rate=1)
+    _check("最少费用 3、第 1 天付清", s1.total_fee == 3 and s1.bill_pay_days["CT-A"] == 1)
+
+    # 固定出纳单：退回已验收的一件，累退不超过该批。
+    contracts.register_return("RT-1", "CT-A", "GRN-1", 1)
+    st2 = contracts.build_payable_statement("CT-A")
+    print(f"  退回批次 GRN-1 一件后：净验收 {st2.net_qty}，确认价 {st2.confirmed_price}，"
+          f"旧库实付仍只扣一次 {st2.old_spent}，应付 {st2.payable_amount}（v{st2.version_no}）")
+    _check("退货后应付 = 1，旧实付不二次扣", st2.payable_amount == 1 and st2.old_spent == 2)
+    s2 = run_case("退一件后当天付清", credit_limit=3, credit_rate=1)
+    _check("费用 0", s2.total_fee == 0)
+    # 旧版本不可变，仍记录应付 4。
+    older = contracts.statement_versions("CT-A")[0]
+    _check("应付单可重开且旧版本冻结", older.payable_amount == 4 and st2.version_no == 2)
+
+    # 恢复原验收口径（另起平行承诺/合同），仅把信用额度收紧到 2。
+    pay_budget.create_commitment("REQ-A2", "YE", 10)
+    pay_budget.register_spend("REQ-A2", 2, "PAY-SP-2")
+    contracts.create_contract(
+        "CT-A2", "REQ-A2", 3, "供应商A", 1, 2, 1, 4
+    )
+    contracts.register_receipt("CT-A2", "GRN-2", 2)
+    contracts.build_payable_statement("CT-A2")
+    s3 = schedule_payments(
+        [bill_of(contracts.latest_statement("CT-A2"))],
+        horizon_days=2, initial_cash=1, deposits={2: 3},
+        credit_limit=2, credit_rate=1,
+    )
+    print(f"  额度收紧到 2：付款日 {s3.bill_pay_days}，迟费 {s3.total_late_fee}，"
+          f"信用费 {s3.total_credit_fee}")
+    _check("只能次日付、迟费 4",
+           s3.bill_pay_days["CT-A2"] == 2 and s3.total_fee == 4)
+
+    # 另一笔：两合同争同日余额。
+    for cid, req in (("CT-X", "REQ-X"), ("CT-Y", "REQ-Y")):
+        pay_budget.create_commitment(req, "YE", 10)
+        contracts.create_contract(cid, req, 2, "供应商B", 1, 2, 1, late_fee=2)
+        contracts.register_receipt(cid, f"GRN-{cid}", 2)
+        contracts.build_payable_statement(cid)
+    two_bills = [bill_of(contracts.latest_statement(c)) for c in ("CT-X", "CT-Y")]
+    s4 = schedule_payments(
+        two_bills, horizon_days=2, initial_cash=10,
+        deposits={2: 10}, credit_limit=0, credit_rate=1,
+    )
+    print(f"  两合同各应付10争同日现金：付款日 {s4.bill_pay_days}，总费用 {s4.total_fee}")
+    _check("当天只能付一张、另一张迟费 2",
+           sorted(s4.bill_pay_days.values()) == [1, 2] and s4.total_fee == 2)
+
+    # 无解情形：现金与额度都覆盖不了到期款。
+    pay_budget.create_commitment("REQ-Z", "YE", 10)
+    contracts.create_contract("CT-Z", "REQ-Z", 1, "供应商C", 1, 1, 1, late_fee=1)
+    contracts.register_receipt("CT-Z", "GRN-CT-Z", 1)
+    contracts.build_payable_statement("CT-Z")
+    try:
+        schedule_payments(
+            [bill_of(contracts.latest_statement("CT-Z"))],
+            horizon_days=2, initial_cash=1, deposits={},
+            credit_limit=3, credit_rate=1,
+        )
+        raise AssertionError("应当无解")
+    except InfeasibleSchedule as exc:
+        print(f"  无解按预期报出: {exc}")
+    # 合同仓全程未代旧库登记实付。
+    _check("不代替旧库实付入账",
+           all(e[0] != "REQ-Z" for e in pay_budget.spend_events())
+           and pay_budget.get_commitment("REQ-Z").spent == 0)
 
     _line("全部演示完成")
     print(f"  数据库目录: {DATA_DIR}")

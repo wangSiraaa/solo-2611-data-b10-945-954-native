@@ -69,3 +69,35 @@ class CommitmentClosedError(BudgetError):
 
 class IdempotencyConflict(BudgetError):
     """同一幂等键被用不同的请求内容重试。"""
+
+
+class ContractError(BudgetError):
+    """合同 / 验收 / 退货 / 应付单相关错误的基类。"""
+
+
+class ContractNotFound(ContractError):
+    """合同不存在。"""
+
+
+class ContractConflict(ContractError):
+    """同一合同号重试但内容不一致，或一个承诺被重复绑定。"""
+
+
+class InvalidContract(ContractError):
+    """合同参数非法，或绑定的承诺不满足开立条件（金额不符 / 已取消）。"""
+
+
+class ReceiptError(ContractError):
+    """验收单非法：单号重复、累计验收超出合同总件数等。"""
+
+
+class ReturnError(ContractError):
+    """退货非法：未指向已验收批次，或累退超过该批验收数量。"""
+
+
+class PayableError(ContractError):
+    """应付单无法成立（如承诺已取消仍试图开支付单、出现追回净额）。"""
+
+
+class InfeasibleSchedule(ContractError):
+    """不存在任何合法付款安排能同时兑现全部到期款。"""
