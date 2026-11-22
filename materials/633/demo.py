@@ -16,6 +16,8 @@ import shutil
 from league.ranking import compute_standings
 from league.schedule_service import ScheduleService
 from league.standings_repo import StandingsRepository
+from league.transport import TransportOffice
+from league.shipping import EquipmentDepot
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 RUN_DIR = os.path.join(HERE, "run_data")
@@ -177,8 +179,82 @@ def main() -> None:
     print("  结论：旧 edition 请求本身合法；错误只发生在 after 身份 + 旧投影的错配。")
     print("  未改动任何最终名次：after 正确名次保持", correct_order)
 
+    # ------------------------------------------------------------ 客队班车凭单
+    banner("7. 运输办公室：按两个真实 edition 生成版本化客队班车凭单")
+    office = TransportOffice(svc)
+    timetable = [
+        {"round": 1, "slot": "s", "kickoff": 2, "dispersal": 3},
+        {"round": 2, "slot": "s", "kickoff": 10, "dispersal": 11},
+        {"round": 3, "slot": "s", "kickoff": 20, "dispersal": 21},
+    ]
+    travel = {(a, b): 1 for a in case["clubs"] for b in case["clubs"] if a != b}
+    office.configure(
+        team_bases={t: t for t in case["clubs"]},       # 每队一处基地
+        team_venues={t: t for t in case["clubs"]},      # 主场场站（可与基地不同）
+        travel=travel, timetable=timetable,
+        lead_beats=1, segment_capacity=1,               # 开赛前 1 拍到、每段一箱
+    )
+    plan_b = office.generate_plan(ed_before)
+    plan_a = office.generate_plan(ed_after)
+    for tag, plan in (("before", plan_b), ("after", plan_a)):
+        ab = next(r for r in plan["runs"] if r["match_id"] == "ab")
+        out = next(l for l in ab["legs"] if l["direction"] == "out")
+        print(f"  [{tag}] ab 客队={ab['team']}：去程 {out['from']} {out['depart']}"
+              f" 拍发 -> {out['to']} {out['arrive']} 拍到，每段可带 "
+              f"{out['capacity']} 箱")
+    print("  车站 A 在无任何托运单时可查凭单：",
+          [r["run_id"] for r in office.vouchers_for_station(ed_before, "A")["runs"]])
+
+    # ------------------------------------------------------------ 器材托运求解
+    banner("8. 器材库：封箱托运，最小化付费直送采购费并交完整交接单")
+    depot_db = os.path.join(RUN_DIR, "depot.db")
+    depot = EquipmentDepot(depot_db, sched_db)
+    box = [{"box_id": "bx1", "origin": "B", "destination": "A",
+            "available_at": 0, "deadline": 2}]
+    offer = [{"offer_id": "o1", "origin": "B", "destination": "A",
+              "depart": 0, "arrive": 1, "capacity": 1, "fee": 5}]
+    print(depot.register_boxes("boxes-1", box))
+    print(depot.register_offers("offers-1", offer))
+
+    def show_solution(tag: str, sol: dict) -> None:
+        print(f"\n[{tag}] 直送采购总费用={sol['total_direct_fee']}，"
+              f"采购单={[o['offer_id'] for o in sol['purchased_offers']]}")
+        for bid, chain in sol["manifests"].items():
+            for c in chain:
+                if c["kind"] == "wait":
+                    print(f"  {bid}: 留站 {c['station']} "
+                          f"{c['from_time']}->{c['to_time']} 拍")
+                else:
+                    print(f"  {bid}: {c['kind']} {c['from']} {c['depart']} -> "
+                          f"{c['to']} {c['arrive']}（{c['lid']}）")
+
+    show_solution("before：比赛车 B→A 免费捎带",
+                  depot.solve("solve-before", ed_before))
+    show_solution("after：免费车改从 A 发，最省 5",
+                  depot.solve("solve-after", ed_after))
+
+    # 保持原班车，再交一只同起讫同时限的箱：容量 1 迫使另买一单
+    depot2 = EquipmentDepot(os.path.join(RUN_DIR, "depot2.db"), sched_db)
+    depot2.register_boxes("boxes-2", box + [
+        {"box_id": "bx2", "origin": "B", "destination": "A",
+         "available_at": 0, "deadline": 2}])
+    depot2.register_offers("offers-2", offer)
+    show_solution("两箱同限：一只免费、一只付费 5",
+                  depot2.solve("solve-two", ed_before))
+
+    # 中站换车：B->A 免费车 + A 留站 + A->C 客队车，零直送费
+    depot3 = EquipmentDepot(os.path.join(RUN_DIR, "depot3.db"), sched_db)
+    depot3.register_boxes("boxes-3", [
+        {"box_id": "tr", "origin": "B", "destination": "C",
+         "available_at": 0, "deadline": 14}])
+    show_solution("中站换车（含留站等待，全程真实运力）",
+                  depot3.solve("solve-transfer", ed_before))
+    depot.close()
+    depot2.close()
+    depot3.close()
+
     # ------------------------------------------------------------ 重开复算
-    banner("7. 关闭重开：edition、原始事实与旧排名解释均可复算")
+    banner("9. 关闭重开：edition、班车版本、原始事实与旧排名解释均可复算")
     repo.close()
     svc.close()
     svc2 = ScheduleService(sched_db)

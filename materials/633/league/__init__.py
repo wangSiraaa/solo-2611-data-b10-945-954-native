@@ -8,6 +8,8 @@
 from .schedule_service import ScheduleService, Issue, CandidateRejected
 from .standings_repo import StandingsRepository, BatchRejected
 from .ranking import compute_standings
+from .transport import TransportOffice, TransportRejected
+from .shipping import EquipmentDepot, ShippingRejected
 
 __all__ = [
     "ScheduleService",
@@ -16,4 +18,8 @@ __all__ = [
     "StandingsRepository",
     "BatchRejected",
     "compute_standings",
+    "TransportOffice",
+    "TransportRejected",
+    "EquipmentDepot",
+    "ShippingRejected",
 ]
