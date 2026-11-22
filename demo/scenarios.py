@@ -11,7 +11,8 @@
 3. 新预算不足被拒绝（组织新产品照发，预算仓继续绑旧版）；
 4. 支出后部分取消（实际支出不撤销，只释放剩余占额）；
 5. 并发承诺争额度（最多一方成功）与同请求重试不二次占额；
-6. 大规模场景：20 部门 / 深度 5 / 100 笔支出，独立重算 + 事件级审计。
+6. 大规模场景：20 部门 / 深度 5 / 100 笔支出，独立重算 + 事件级审计；
+7. 封样名册与内审抽查：同一原票一封、归层、冻结重开，配额最省。
 """
 
 from __future__ import annotations
@@ -19,12 +20,14 @@ from __future__ import annotations
 import random
 import shutil
 import threading
+from fractions import Fraction
 from pathlib import Path
 
 from orgbudget import BudgetService, OrgService
-from orgbudget.audit import audit_scheme, independent_allocate
+from orgbudget.audit import audit_roster, audit_scheme, independent_allocate
 from orgbudget.budget import WeightedChild, allocate_children
 from orgbudget.errors import CommitmentClosedError, InsufficientFunds
+from orgbudget.sampling import plan_for_roster
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "demo_data"
 
@@ -285,10 +288,104 @@ def main() -> None:
            and audit2.total_spent == audit1.total_spent)
     _check("旧方案仍按旧树审计通过", audit_old.org_version == bv1)
 
+    # ------------------------------------------------------------ 7. 封样与抽查
+    _line("案例 7：封样名册与内审抽查（同一原票一封、归层、最省配额）")
+    roster_demo()
+
     _line("全部演示完成")
     print(f"  数据库目录: {DATA_DIR}")
     print("  - org.db / budget.db      小案例组织库与预算库")
     print("  - big_org.db / big_budget.db  20 部门大规模场景")
+    print("  - roster/                 封样名册与抽查小册")
+
+
+def roster_demo() -> None:
+    """封样名册 + 内审抽查：题面小册的三个数量与费用。"""
+    root = DATA_DIR / "roster"
+    if root.exists():
+        shutil.rmtree(root)
+    root.mkdir(parents=True)
+    org = OrgService(root / "org.db")
+    budget = BudgetService(root / "budget.db", org)
+    for dept, parent in [
+        ("HQ", None), ("X", "HQ"), ("Y", "HQ"),
+        ("X1", "X"), ("X2", "X"), ("X3", "X"), ("X4", "X"),
+        ("Y1", "Y"), ("Y2", "Y"),
+    ]:
+        org.create_department(dept, parent)
+    v1 = org.publish("小册 v1").version
+    p1 = org.get_product(v1)
+    budget.register_root_budget(
+        v1, 100_000, {(d, k): 1 for d in p1.department_ids for k in p1.children(d)}
+    )
+
+    # X 四个叶各一件、Y 两个叶各一件，共六张原票六笔实付。
+    for seq, dept in enumerate(("X1", "X2", "X3", "X4", "Y1", "Y2"), start=1):
+        req = f"SR-{seq}"
+        budget.create_commitment(req, dept, 1_000)
+        budget.register_spend(req, 100, f"SE-{seq}")
+        budget.register_ticket(f"T-{seq}")
+        budget.assign_spend(f"SE-{seq}", f"T-{seq}")
+    roster = budget.seal_roster(v1)
+    print(f"  名册 {roster.roster_id}: 层封数 {dict(roster.layer_sizes())}，"
+          f"实付 {roster.payment_count} 笔，摘要 {roster.cut_digest[:12]}…")
+    _check("X 4 封、Y 2 封、每封一件",
+           dict(roster.layer_sizes()) == {"X": 4, "Y": 2}
+           and roster.envelope_count == 6)
+
+    p = Fraction(1, 2)
+    plan = plan_for_roster(roster, {"X": 1, "Y": 2}, 1, p)
+    print(f"  成本每封 X=1/Y=2，k=1，p={p}: 配额 {plan.quotas}，"
+          f"费用 {plan.total_cost}，最不利分布 {plan.worst_misses}，"
+          f"保证 {plan.guarantee}")
+    _check("最省 2+1 封、费用 4",
+           plan.quotas == (2, 1) and plan.total_cost == 4)
+    recheck = audit_roster(budget.db_path, org.db_path, roster.roster_id)
+    print(f"  独立复点 {len(recheck.checks)} 项全部通过")
+
+    # 只把 X1 这一叶移到 Y 下并发布组织新版；实付原件仍是六封。
+    org.move_subtree("X1", "Y")
+    v2 = org.publish("X1 移到 Y 下").version
+    roster2 = budget.seal_roster(v2)
+    plan2 = plan_for_roster(roster2, {"X": 1, "Y": 2}, 1, p)
+    print(f"  迁移后名册: 层封数 {dict(roster2.layer_sizes())}，"
+          f"配额 {plan2.quotas}，费用 {plan2.total_cost}")
+    _check("实付原件仍六封，须 2+2 封、费用 6",
+           roster2.envelope_count == 6
+           and plan2.quotas == (2, 2) and plan2.total_cost == 6)
+
+    # 沿原组织只把 p 改为 2/3。
+    plan3 = plan_for_roster(roster, {"X": 1, "Y": 2}, 1, Fraction(2, 3))
+    print(f"  原组织 p=2/3: 配额 {plan3.quotas}，费用 {plan3.total_cost}")
+    _check("须 3+2 封、费用 7",
+           plan3.quotas == (3, 2) and plan3.total_cost == 7)
+
+    # 旧名册仍可重开。
+    old = budget.get_roster(roster.roster_id)
+    _check("旧名册重开仍是 X4/Y2",
+           dict(old.layer_sizes()) == {"X": 4, "Y": 2}
+           and old.cut_digest == roster.cut_digest)
+
+    # 跨部门票进联合层。
+    budget.create_commitment("SJ-1", "X2", 400)
+    budget.register_spend("SJ-1", 80, "SJ-S1")
+    budget.create_commitment("SJ-2", "Y1", 400)
+    budget.register_spend("SJ-2", 80, "SJ-S2")
+    budget.register_ticket("T-JOINT")
+    budget.assign_spend("SJ-S1", "T-JOINT")
+    budget.assign_spend("SJ-S2", "T-JOINT")
+    v3 = org.publish("联合票").version
+    roster3 = budget.seal_roster(v3)
+    print(f"  跨部门票入册后层封数: {dict(roster3.layer_sizes())}")
+    _check("跨分部归联合层，一票一封",
+           roster3.layer("联合").envelope_count == 1
+           and roster3.layer("联合").envelopes[0].payment_count == 2)
+
+    # k>1：不能把“发现一封”的概率简单相加。
+    print("  k=2 反例：两层各 2 封，各开 1 封时最不利分布 (1,1)，"
+          "漏检 = 1/2*1/2 = 1/4，发现 3/4；简单相加 1/2+1/2=1 会高估。")
+    _check("至少查到一封的概率不是各层相加",
+           Fraction(3, 4) < Fraction(1))
 
 
 if __name__ == "__main__":

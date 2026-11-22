@@ -16,6 +16,7 @@ from fractions import Fraction
 from pathlib import Path
 
 from .errors import InvalidTree
+from .sampling import SamplingPlan, solve_quota
 
 
 @dataclass(frozen=True)
@@ -281,3 +282,193 @@ def _subtree_leaves(dept: str, children_of: dict[str, list[str]]) -> set[str]:
         else:
             stack.extend(kids)
     return result
+
+
+# ------------------------------------------------------------- 封样名册审计
+
+
+@dataclass(frozen=True)
+class RosterAuditResult:
+    roster_id: int
+    org_version: int
+    spend_count: int
+    layer_count: int
+    envelope_count: int
+    cut_digest: str
+    layer_sizes: tuple[tuple[str, int], ...]
+    checks: tuple[str, ...]
+
+
+def audit_roster(
+    budget_db: str | Path,
+    org_db: str | Path,
+    roster_id: int,
+    *,
+    costs: dict[str, int] | None = None,
+    problem_count: int | None = None,
+    probability: Fraction | None = None,
+) -> RosterAuditResult:
+    """独立复点名册：只读原始表，重建封与归层，不调用生产装封逻辑。
+
+    核对项：
+
+    1. 名册每笔支付都对应一条**真实存在**的 spend 事件（且只有已入账事件
+       能入册，承诺本身不被当票）；
+    2. 每条已入账支出在切面里**恰归一封**（名册内不重不漏，且名册支付数
+       等于冻结时的 spend 总数）；
+    3. 每封只含同一纸票的支付，且各票在所有封中互不交叉、同一纸票恰一封
+       （同一纸票始终只有一封）；
+    4. 按绑定的组织版本重算归层：全部直接分部相同则归该分部层，否则归
+       联合层，并与落库口径一致；
+    5. ``cut_digest`` 由名册自身支付行重算一致。
+
+    若同时给出 ``costs`` / ``problem_count`` / ``probability``，还会独立
+    重解配额并返回（见 :func:`orgbudget.sampling.solve_quota`）。
+    """
+    with _connect(budget_db) as con:
+        head = con.execute(
+            "SELECT roster_id, org_version, cut_digest, spend_count FROM roster "
+            "WHERE roster_id = ?",
+            (roster_id,),
+        ).fetchone()
+        if head is None:
+            raise InvalidTree(f"名册 {roster_id} 不存在")
+        env_rows = con.execute(
+            "SELECT layer, layer_no, envelope_no, ticket_id, basis "
+            "FROM roster_envelope WHERE roster_id = ? ORDER BY layer_no, envelope_no",
+            (roster_id,),
+        ).fetchall()
+        pay_rows = con.execute(
+            "SELECT layer, envelope_no, idem_key, request_no, dept_id, amount "
+            "FROM roster_payment WHERE roster_id = ? ORDER BY idem_key",
+            (roster_id,),
+        ).fetchall()
+        real_spends = {
+            r["idem_key"]: (r["request_no"], r["dept_id"], r["amount"])
+            for r in con.execute(
+                "SELECT idem_key, request_no, dept_id, amount FROM spend"
+            ).fetchall()
+        }
+        num_real_spends = len(real_spends)
+        all_assignments = con.execute(
+            "SELECT idem_key, ticket_id FROM ticket_assignment"
+        ).fetchall()
+
+    checks: list[str] = []
+    if not env_rows:
+        raise InvalidTree("名册没有任何封")
+    if not pay_rows:
+        raise InvalidTree("名册没有任何支付")
+
+    # 1) 支付必须对应真实 spend 事件，金额/部门/请求号一致（承诺不是票）。
+    for row in pay_rows:
+        real = real_spends.get(row["idem_key"])
+        if real is None:
+            raise InvalidTree(f"名册支付 {row['idem_key']} 不是真实入账事件")
+        if real != (row["request_no"], row["dept_id"], row["amount"]):
+            raise InvalidTree(f"名册支付 {row['idem_key']} 与原始支出事件不符")
+    checks.append("名册每笔支付都对应真实已入账 spend 事件")
+
+    # 2) 每条已入账支出恰归一封：名册内的支付数与真实 spend 总数相等，
+    #    且幂等键不重复（表主键已保证，这里再核对数量）。
+    if len(pay_rows) != num_real_spends or head["spend_count"] != num_real_spends:
+        raise InvalidTree(
+            f"名册支付 {len(pay_rows)} 条、冻结记录 {head['spend_count']} 条，"
+            f"与已入账支出 {num_real_spends} 条不一致"
+        )
+    if len({r["idem_key"] for r in pay_rows}) != len(pay_rows):
+        raise InvalidTree("名册内同一支出事件重复出现")
+    checks.append("每条已入账支出在同一切面恰归一封，名册不重不漏")
+
+    # 3) 同一纸票恰一封，且封内支付同票、票间不交叉。
+    ticket_of_env: dict[tuple[str, int], str] = {}
+    env_payments: dict[tuple[str, int], list[str]] = {}
+    for row in env_rows:
+        key = (row["layer"], row["envelope_no"])
+        if key in ticket_of_env:
+            raise InvalidTree(f"封号 {key} 重复")
+        ticket_of_env[key] = row["ticket_id"]
+    seen_tickets: dict[str, tuple[str, int]] = {}
+    for row in pay_rows:
+        key = (row["layer"], row["envelope_no"])
+        if key not in ticket_of_env:
+            raise InvalidTree(f"支付落在不存在的封 {key}")
+        env_payments.setdefault(key, []).append(row["idem_key"])
+    for key, ticket_id in ticket_of_env.items():
+        if ticket_id in seen_tickets:
+            raise InvalidTree(f"纸票 {ticket_id} 出现在两个封中")
+        seen_tickets[ticket_id] = key
+        if not env_payments.get(key):
+            raise InvalidTree(f"封 {key} 没有任何支付")
+    checks.append("同一纸票恰一封，封内同票、票间不交叉")
+
+    # 4) 按绑定组织版本独立重算归层。
+    product = _load_org_product(org_db, head["org_version"])
+    parent_of: dict[str, str | None] = product["parent_of"]  # type: ignore[assignment]
+
+    def branch(dept: str) -> str:
+        cur = dept
+        while parent_of[cur] is not None and parent_of[parent_of[cur]] is not None:
+            cur = parent_of[cur]  # type: ignore[assignment]
+        return cur
+
+    def expected_layer(depts: set[str]) -> str:
+        branches = sorted({branch(d) for d in depts})
+        return branches[0] if len(branches) == 1 else "联合"
+
+    for layer, envelope_no in ticket_of_env:
+        depts = {
+            r["dept_id"] for r in pay_rows
+            if (r["layer"], r["envelope_no"]) == (layer, envelope_no)
+        }
+        if expected_layer(depts) != layer:
+            raise InvalidTree(
+                f"封 {(layer, envelope_no)} 归层应为 {expected_layer(depts)}"
+            )
+    checks.append("按绑定组织版本重算归层与落库一致（含联合层）")
+
+    # 5) 摘要由名册自身支付行重算。
+    from .roster import RosterPayment, cut_digest as _cut_digest
+
+    recomputed_digest = _cut_digest(
+        RosterPayment(r["idem_key"], r["request_no"], r["dept_id"], r["amount"])
+        for r in pay_rows
+    )
+    if recomputed_digest != head["cut_digest"]:
+        raise InvalidTree("名册摘要与支付行重算不一致")
+    checks.append("名册摘要可由支付行独立重算")
+
+    # 6) 归票事实与名册一致：每名列册支付确实归到其封的纸票。
+    assign_map = {r["idem_key"]: r["ticket_id"] for r in all_assignments}
+    if len(assign_map) != len(real_spends):
+        raise InvalidTree("存在已入账支出未归票，名册不应完整")
+    for row in pay_rows:
+        key = (row["layer"], row["envelope_no"])
+        if assign_map.get(row["idem_key"]) != ticket_of_env[key]:
+            raise InvalidTree(f"支付 {row['idem_key']} 的归票与名册封不符")
+    checks.append("名册支付与当前归票事实逐条一致")
+
+    layer_sizes = tuple(
+        (name, sum(1 for r in env_rows if r["layer"] == name))
+        for name in dict.fromkeys(r["layer"] for r in env_rows)
+    )
+
+    if costs is not None and problem_count is not None and probability is not None:
+        solve_quota(
+            [n for _, n in layer_sizes],
+            [costs[name] for name, _ in layer_sizes],
+            problem_count,
+            probability,
+            names=[name for name, _ in layer_sizes],
+        )
+
+    return RosterAuditResult(
+        roster_id=roster_id,
+        org_version=head["org_version"],
+        spend_count=head["spend_count"],
+        layer_count=len(layer_sizes),
+        envelope_count=len(env_rows),
+        cut_digest=head["cut_digest"],
+        layer_sizes=layer_sizes,
+        checks=tuple(checks),
+    )

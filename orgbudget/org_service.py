@@ -145,6 +145,22 @@ class OrgProduct:
     def depth(self, dept_id: str) -> int:
         return len(self.ancestors(dept_id))
 
+    def direct_branch(self, dept_id: str) -> str:
+        """部门所在的根下直接分部（即“根的某一直接孩子”）。
+
+        根本身没有直接分部，单独返回根本身的 ID。装封归层只沿本产品
+        自身的树边判断，绝不引用当前工作副本。
+        """
+        self._require(dept_id)
+        cur = dept_id
+        # 向上走到“父就是根”的那一层即是直接分部；根本身直接返回。
+        while (
+            self.parent_of[cur] is not None
+            and self.parent_of[self.parent_of[cur]] is not None
+        ):
+            cur = self.parent_of[cur]
+        return cur
+
     def max_depth(self) -> int:
         return max(self.depth(d) for d in self.parent_of)
 

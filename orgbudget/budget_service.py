@@ -25,14 +25,29 @@ from .errors import (
     IdempotencyConflict,
     InactiveDepartment,
     InactiveLeaf,
+    IncompleteRoster,
     InsufficientFunds,
     InvalidTree,
     NotALeaf,
     OrganizationVersionNotFound,
+    RosterNotFound,
     SchemeError,
+    SpendEventNotFound,
+    TicketConflict,
+    TicketNotFound,
     WeightError,
 )
 from .org_service import OrgProduct, OrgService
+from .roster import (
+    JOINT_LAYER,
+    Roster,
+    RosterEnvelope,
+    RosterLayer,
+    RosterPayment,
+    TicketAssignment,
+    classify_layer,
+    cut_digest,
+)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -86,6 +101,54 @@ CREATE TABLE IF NOT EXISTS rejected_revision (
     reason       TEXT NOT NULL,
     created_at   TEXT NOT NULL
 );
+-- 具名纸票：一次冻结里同一纸票始终恰好一封。
+CREATE TABLE IF NOT EXISTS paper_ticket (
+    ticket_id   TEXT PRIMARY KEY,
+    note        TEXT,
+    created_at  TEXT NOT NULL
+);
+-- 已实付事件的归票。每条实付事件至多归一张纸票；可整条改挂（勘误）。
+-- 只引用 spend(idem_key) 且 spend.idem_key 唯一，天然只能归“已实际入账”的事件。
+CREATE TABLE IF NOT EXISTS ticket_assignment (
+    idem_key     TEXT PRIMARY KEY REFERENCES spend(idem_key),
+    ticket_id    TEXT NOT NULL REFERENCES paper_ticket(ticket_id),
+    note         TEXT,
+    assigned_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ticket_assignment_ticket
+    ON ticket_assignment(ticket_id);
+-- 冻结签发的封样名册（不可变快照）。旧名册与后续更正/迁移无关，永远可重开。
+CREATE TABLE IF NOT EXISTS roster (
+    roster_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_version  INTEGER NOT NULL,
+    cut_digest   TEXT NOT NULL,
+    spend_count  INTEGER NOT NULL,
+    created_at   TEXT NOT NULL,
+    note         TEXT
+);
+CREATE TABLE IF NOT EXISTS roster_envelope (
+    roster_id    INTEGER NOT NULL REFERENCES roster(roster_id),
+    layer_no     INTEGER NOT NULL,
+    layer        TEXT NOT NULL,
+    envelope_no  INTEGER NOT NULL,
+    ticket_id    TEXT NOT NULL,
+    basis        TEXT NOT NULL,
+    PRIMARY KEY (roster_id, layer, envelope_no)
+);
+CREATE TABLE IF NOT EXISTS roster_payment (
+    roster_id    INTEGER NOT NULL REFERENCES roster(roster_id),
+    layer        TEXT NOT NULL,
+    envelope_no  INTEGER NOT NULL,
+    idem_key     TEXT NOT NULL,
+    request_no   TEXT NOT NULL,
+    dept_id      TEXT NOT NULL,
+    amount       INTEGER NOT NULL,
+    PRIMARY KEY (roster_id, idem_key),
+    FOREIGN KEY (roster_id, layer, envelope_no)
+        REFERENCES roster_envelope(roster_id, layer, envelope_no)
+);
+CREATE INDEX IF NOT EXISTS idx_roster_payment_env
+    ON roster_payment(roster_id, layer, envelope_no);
 """
 
 _OPEN = "OPEN"
@@ -549,6 +612,269 @@ class BudgetService:
         with self._connect() as con:
             return tuple(con.execute(sql, params).fetchall())
 
+    # ---------------------------------------------------------------- 装封与名册
+
+    def register_ticket(self, ticket_id: str, note: Optional[str] = None) -> str:
+        """登记一张具名原票。
+
+        幂等：同名纸票重复登记不报错，只保留首次的备注。
+        """
+        if not isinstance(ticket_id, str) or not ticket_id:
+            raise ValueError("纸票名不能为空")
+        with self._connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            con.execute(
+                "INSERT OR IGNORE INTO paper_ticket(ticket_id, note, created_at) "
+                "VALUES (?, ?, ?)",
+                (ticket_id, note, datetime.now(timezone.utc).isoformat()),
+            )
+            con.commit()
+        return ticket_id
+
+    def assign_spend(
+        self,
+        idem_key: str,
+        ticket_id: str,
+        *,
+        note: Optional[str] = None,
+    ) -> TicketAssignment:
+        """把一条**已实际入账**的支出事件归到具名纸票。
+
+        只有 ``spend`` 表里真实存在的幂等键才能入封；同一事件在同一切面
+        恰归一张票，重复归到同一票是幂等空操作；要换票请显式
+        :meth:`reassign_spend`（勘误）——本方法遇到不同票会报
+        ``TicketConflict``，避免误覆盖。
+        """
+        if not isinstance(idem_key, str) or not idem_key:
+            raise ValueError("幂等键不能为空")
+        with self._connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            self._require_spend_locked(con, idem_key)
+            self._require_ticket_locked(con, ticket_id)
+            row = con.execute(
+                "SELECT ticket_id FROM ticket_assignment WHERE idem_key = ?",
+                (idem_key,),
+            ).fetchone()
+            if row is not None:
+                if row[0] != ticket_id:
+                    raise TicketConflict(
+                        f"支出事件 {idem_key} 已归票 {row[0]}，勘误请用 reassign_spend"
+                    )
+                con.commit()
+                return self._load_assignment(con, idem_key)
+            con.execute(
+                "INSERT INTO ticket_assignment(idem_key, ticket_id, note, assigned_at) "
+                "VALUES (?, ?, ?, ?)",
+                (idem_key, ticket_id, note, datetime.now(timezone.utc).isoformat()),
+            )
+            con.commit()
+            return self._load_assignment(con, idem_key)
+
+    def reassign_spend(
+        self,
+        idem_key: str,
+        ticket_id: str,
+        *,
+        note: Optional[str] = None,
+    ) -> TicketAssignment:
+        """勘误归票：把已入账事件改挂到另一张具名纸票（或首次归票）。"""
+        if not isinstance(idem_key, str) or not idem_key:
+            raise ValueError("幂等键不能为空")
+        with self._connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            self._require_spend_locked(con, idem_key)
+            self._require_ticket_locked(con, ticket_id)
+            con.execute(
+                "INSERT INTO ticket_assignment(idem_key, ticket_id, note, assigned_at) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(idem_key) DO UPDATE SET "
+                "ticket_id = excluded.ticket_id, note = excluded.note, "
+                "assigned_at = excluded.assigned_at",
+                (idem_key, ticket_id, note, datetime.now(timezone.utc).isoformat()),
+            )
+            con.commit()
+            return self._load_assignment(con, idem_key)
+
+    def ticket_assignments(
+        self, ticket_id: Optional[str] = None
+    ) -> tuple[TicketAssignment, ...]:
+        """当前各支出事件的归票（含纸票/事件明细），按幂等键排序。"""
+        sql = (
+            "SELECT a.idem_key, a.ticket_id, s.request_no, s.dept_id, s.amount, "
+            "a.assigned_at, a.note FROM ticket_assignment a "
+            "JOIN spend s ON s.idem_key = a.idem_key "
+            + ("WHERE a.ticket_id = ? " if ticket_id else "")
+            + "ORDER BY a.idem_key"
+        )
+        params: tuple = (ticket_id,) if ticket_id else ()
+        with self._connect() as con:
+            rows = con.execute(sql, params).fetchall()
+        return tuple(TicketAssignment(*row) for row in rows)
+
+    def unassigned_spends(self) -> tuple[RosterPayment, ...]:
+        """尚未归票的已入账支出事件（完整名册必须为空）。"""
+        with self._connect() as con:
+            rows = con.execute(
+                "SELECT idem_key, request_no, dept_id, amount FROM spend "
+                "WHERE idem_key NOT IN (SELECT idem_key FROM ticket_assignment) "
+                "ORDER BY id"
+            ).fetchall()
+        return tuple(RosterPayment(*row) for row in rows)
+
+    def seal_roster(
+        self, org_version: int, *, note: Optional[str] = None
+    ) -> Roster:
+        """冻结一次完整封样名册，绑定一个**已发布组织版本**。
+
+        冻结时校验：所有已入账支出事件都已归票（否则报
+        ``IncompleteRoster``，不签发残缺名册）；各原票按本组织版本的根下
+        直接分部归层，跨分部归联合层。名册一经签发即不可变，之后勘误或
+        迁移不影响它；下一次冻结才产生新名册。
+        """
+        product = self.org.get_product(org_version)
+        with self._connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            unassigned = con.execute(
+                "SELECT COUNT(*) FROM spend "
+                "WHERE idem_key NOT IN (SELECT idem_key FROM ticket_assignment)"
+            ).fetchone()[0]
+            if unassigned:
+                raise IncompleteRoster(
+                    f"仍有 {unassigned} 条已实际入账支出未归票，不能签发完整名册"
+                )
+            rows = con.execute(
+                "SELECT s.idem_key, s.request_no, s.dept_id, s.amount, a.ticket_id "
+                "FROM spend s JOIN ticket_assignment a ON a.idem_key = s.idem_key "
+                "ORDER BY s.id"
+            ).fetchall()
+            if not rows:
+                raise IncompleteRoster("没有任何已入账支出，不能签发空名册")
+
+            by_ticket: dict[str, list[RosterPayment]] = {}
+            for idem_key, request_no, dept_id, amount, ticket_id in rows:
+                by_ticket.setdefault(ticket_id, []).append(
+                    RosterPayment(idem_key, request_no, dept_id, amount)
+                )
+
+            # 逐票归层；同层按纸票名排序，层内封号从 1 连续编号。
+            envelopes_by_layer: dict[str, list[tuple[str, str, list[RosterPayment]]]] = {}
+            for ticket_id in sorted(by_ticket):
+                payments = by_ticket[ticket_id]
+                layer, basis = classify_layer(
+                    product, (p.dept_id for p in payments)
+                )
+                envelopes_by_layer.setdefault(layer, []).append(
+                    (ticket_id, basis, payments)
+                )
+            # 层序：先按直接分部 ID 升序，联合层固定最后。
+            layer_names = sorted(
+                envelopes_by_layer, key=lambda name: (name == JOINT_LAYER, name)
+            )
+
+            all_payments = [p for group in by_ticket.values() for p in group]
+            digest = cut_digest(all_payments)
+            created_at = datetime.now(timezone.utc).isoformat()
+            cur = con.execute(
+                "INSERT INTO roster(org_version, cut_digest, spend_count, created_at, note) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (org_version, digest, len(all_payments), created_at, note),
+            )
+            roster_id = int(cur.lastrowid)
+
+            for layer_no, layer in enumerate(layer_names, start=1):
+                for envelope_no, (ticket_id, basis, payments) in enumerate(
+                    envelopes_by_layer[layer], start=1
+                ):
+                    con.execute(
+                        "INSERT INTO roster_envelope"
+                        "(roster_id, layer_no, layer, envelope_no, ticket_id, basis) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        (roster_id, layer_no, layer, envelope_no, ticket_id, basis),
+                    )
+                    con.executemany(
+                        "INSERT INTO roster_payment"
+                        "(roster_id, layer, envelope_no, idem_key, request_no, dept_id, amount) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        [
+                            (roster_id, layer, envelope_no, p.idem_key,
+                             p.request_no, p.dept_id, p.amount)
+                            for p in payments
+                        ],
+                    )
+            con.commit()
+        return self.get_roster(roster_id)
+
+    def get_roster(self, roster_id: int) -> Roster:
+        """原样重开一份旧名册（独立于后续勘误、迁移与新增支出）。"""
+        with self._connect() as con:
+            head = con.execute(
+                "SELECT roster_id, org_version, created_at, cut_digest, spend_count, note "
+                "FROM roster WHERE roster_id = ?",
+                (roster_id,),
+            ).fetchone()
+            if head is None:
+                raise RosterNotFound(f"封样名册 {roster_id} 不存在")
+            env_rows = con.execute(
+                "SELECT layer_no, layer, envelope_no, ticket_id, basis "
+                "FROM roster_envelope WHERE roster_id = ? "
+                "ORDER BY layer_no, envelope_no",
+                (roster_id,),
+            ).fetchall()
+            pay_rows = con.execute(
+                "SELECT layer, envelope_no, idem_key, request_no, dept_id, amount "
+                "FROM roster_payment WHERE roster_id = ? ORDER BY idem_key",
+                (roster_id,),
+            ).fetchall()
+        payments: dict[tuple[str, int], list[RosterPayment]] = {}
+        for layer, envelope_no, idem_key, request_no, dept_id, amount in pay_rows:
+            payments.setdefault((layer, envelope_no), []).append(
+                RosterPayment(idem_key, request_no, dept_id, amount)
+            )
+        layers: list[RosterLayer] = []
+        by_layer: dict[str, list[RosterEnvelope]] = {}
+        layer_order: dict[str, int] = {}
+        for layer_no, layer, envelope_no, ticket_id, basis in env_rows:
+            layer_order.setdefault(layer, layer_no)
+            by_layer.setdefault(layer, []).append(
+                RosterEnvelope(
+                    layer=layer,
+                    layer_no=layer_no,
+                    envelope_no=envelope_no,
+                    ticket_id=ticket_id,
+                    basis=basis,
+                    payments=tuple(payments.get((layer, envelope_no), [])),
+                )
+            )
+        for layer in sorted(by_layer, key=lambda name: layer_order[name]):
+            envelopes = tuple(by_layer[layer])
+            layers.append(
+                RosterLayer(
+                    layer=layer,
+                    layer_no=layer_order[layer],
+                    envelope_count=len(envelopes),
+                    envelopes=envelopes,
+                )
+            )
+        return Roster(
+            roster_id=head[0],
+            org_version=head[1],
+            created_at=head[2],
+            cut_digest=head[3],
+            spend_count=head[4],
+            layers=tuple(layers),
+            note=head[5],
+        )
+
+    def rosters(self) -> tuple[tuple[int, int, str, int, str], ...]:
+        """全部已签发名册摘要：(名册号, 组织版本, 签发时间, 支付数, 摘要)。"""
+        with self._connect() as con:
+            return tuple(
+                con.execute(
+                    "SELECT roster_id, org_version, created_at, spend_count, cut_digest "
+                    "FROM roster ORDER BY roster_id"
+                ).fetchall()
+            )
+
     # ---------------------------------------------------------------- 内部
 
     def _require_active(self, con: sqlite3.Connection) -> int:
@@ -557,6 +883,32 @@ class BudgetService:
             raise SchemeError("尚无生效预算方案")
         return sid
 
+    def _require_spend_locked(self, con: sqlite3.Connection, idem_key: str) -> None:
+        row = con.execute(
+            "SELECT 1 FROM spend WHERE idem_key = ?", (idem_key,)
+        ).fetchone()
+        if row is None:
+            raise SpendEventNotFound(
+                f"支出事件 {idem_key} 不存在或尚未实际入账，不能入封"
+            )
+
+    def _require_ticket_locked(self, con: sqlite3.Connection, ticket_id: str) -> None:
+        row = con.execute(
+            "SELECT 1 FROM paper_ticket WHERE ticket_id = ?", (ticket_id,)
+        ).fetchone()
+        if row is None:
+            raise TicketNotFound(f"纸票 {ticket_id} 不存在，请先登记")
+
+    def _load_assignment(
+        self, con: sqlite3.Connection, idem_key: str
+    ) -> TicketAssignment:
+        row = con.execute(
+            "SELECT a.idem_key, a.ticket_id, s.request_no, s.dept_id, s.amount, "
+            "a.assigned_at, a.note FROM ticket_assignment a "
+            "JOIN spend s ON s.idem_key = a.idem_key WHERE a.idem_key = ?",
+            (idem_key,),
+        ).fetchone()
+        return TicketAssignment(*row)
     def _spent_locked(self, con: sqlite3.Connection, request_no: str) -> int:
         return int(
             con.execute(

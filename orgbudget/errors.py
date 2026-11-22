@@ -69,3 +69,36 @@ class CommitmentClosedError(BudgetError):
 
 class IdempotencyConflict(BudgetError):
     """同一幂等键被用不同的请求内容重试。"""
+
+
+# ------------------------------------------------------------- 装封与抽查
+
+
+class TicketError(BudgetError):
+    """装封名册相关错误基类（与预算金额错误同属预算仓）。"""
+
+
+class SpendEventNotFound(TicketError):
+    """被引用的实际支出事件（幂等键）不存在，或尚未实际入账。"""
+
+
+class TicketNotFound(TicketError):
+    """请求的原票不存在。"""
+
+
+class RosterNotFound(TicketError):
+    """请求的封样名册不存在。"""
+
+
+
+class TicketConflict(TicketError):
+    """支出事件的归票与该事件已登记的具名纸票冲突。"""
+
+
+class IncompleteRoster(TicketError):
+    """批次未配齐（仍有已实付事件未归票），不能签发完整名册。"""
+
+
+class InvalidAuditRequest(TicketError):
+    """抽查参数非法（层数/封数/概率/成本等不满足约束）。"""
+
