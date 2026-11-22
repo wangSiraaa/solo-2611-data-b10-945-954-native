@@ -26,7 +26,16 @@ from .errors import (
     RootError,
     WeightError,
 )
+from .auth import AuthBook, AuthEntry, HANDLER, REVIEWER, resolve_role
+from .auth_service import AuthService
+from .countersign_service import (
+    AuthorityExplanation,
+    CountersignService,
+    PrintRoomService,
+    SignableList,
+)
 from .org_service import OrgProduct, OrgService
+from .print_room import AbsencePlan, BlockedSheet, DocCandidate, PrepPlan, PrintRound, Witness
 
 __all__ = [
     "OrgService",
@@ -36,6 +45,22 @@ __all__ = [
     "NodeSummary",
     "SchemeInfo",
     "allocate_children",
+    "AuthService",
+    "AuthBook",
+    "AuthEntry",
+    "HANDLER",
+    "REVIEWER",
+    "resolve_role",
+    "CountersignService",
+    "PrintRoomService",
+    "SignableList",
+    "AuthorityExplanation",
+    "PrintRound",
+    "DocCandidate",
+    "AbsencePlan",
+    "PrepPlan",
+    "Witness",
+    "BlockedSheet",
     "BudgetError",
     "CommitmentClosedError",
     "CommitmentNotFound",

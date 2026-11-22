@@ -69,3 +69,71 @@ class CommitmentClosedError(BudgetError):
 
 class IdempotencyConflict(BudgetError):
     """同一幂等键被用不同的请求内容重试。"""
+
+
+class AuthError(Exception):
+    """授权本服务的所有错误基类。"""
+
+
+class InvalidRole(AuthError):
+    """角色不在经办 / 复核两道印之内。"""
+
+
+class AuthEditionNotFound(AuthError):
+    """授权本版本不存在或尚未发布过任何版本。"""
+
+
+class SigningError(Exception):
+    """会签询证的所有错误基类；拒绝时只说明理由，不产出空白凭证。"""
+
+
+class InvalidPaymentAmount(SigningError):
+    """请付金额不是正整数。"""
+
+
+class CommitmentNotOpen(SigningError):
+    """承诺已取消，不能再询证会签。"""
+
+
+class InsufficientCommitmentRemaining(SigningError):
+    """请付金额超过未取消承诺的真实剩余。"""
+
+
+class NoSignerAvailable(SigningError):
+    """两道印中至少一道在本次取值下没有任何被授予的人。"""
+
+
+class SignableListNotFound(SigningError):
+    """询证名单编号不存在。"""
+
+
+class PrintRoomError(Exception):
+    """印务室备印与正式登记的所有错误基类。"""
+
+
+class StampFeeMissing(PrintRoomError):
+    """某个候选“人、角色”缺少一次印金。"""
+
+
+class InfeasiblePrep(PrintRoomError):
+    """即使全备也无法让某个缺席预案盖齐全批单。"""
+
+
+class StampNotPrepared(PrintRoomError):
+    """正式登记时用到了未备印的“人、角色”。"""
+
+
+class PersonOffDuty(PrintRoomError):
+    """正式登记时用到了实际缺席的人。"""
+
+
+class PersonOccupied(PrintRoomError):
+    """同一人在一轮内被第二次占印。"""
+
+
+class IncompatibleAssignees(PrintRoomError):
+    """同一张单配对了本轮互斥名单上的两个人。"""
+
+
+class ReceiptConflict(PrintRoomError):
+    """同回执号被用不同的签单内容重复打开。"""
