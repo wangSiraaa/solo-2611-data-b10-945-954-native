@@ -23,10 +23,27 @@ from .errors import (
     InvalidTree,
     NotALeaf,
     OrganizationVersionNotFound,
+    PlateError,
+    PlateInputError,
     RootError,
+    VoucherConflict,
+    VoucherError,
+    VoucherHandOffError,
+    VoucherNotFound,
+    VoucherVerifyError,
     WeightError,
 )
+from .flow_voucher import FlowBand, FlowVoucher, OccupancyFact, VoucherLine
 from .org_service import OrgProduct, OrgService
+from .plate import (
+    Crossing,
+    PlateConstraints,
+    SideConstraints,
+    WorkOrder,
+    issue_work_order,
+    issue_work_order_from_payload,
+)
+from .voucher_service import VoucherService
 
 __all__ = [
     "OrgService",
@@ -36,6 +53,17 @@ __all__ = [
     "NodeSummary",
     "SchemeInfo",
     "allocate_children",
+    "VoucherService",
+    "FlowVoucher",
+    "FlowBand",
+    "VoucherLine",
+    "OccupancyFact",
+    "PlateConstraints",
+    "SideConstraints",
+    "Crossing",
+    "WorkOrder",
+    "issue_work_order",
+    "issue_work_order_from_payload",
     "BudgetError",
     "CommitmentClosedError",
     "CommitmentNotFound",
@@ -47,6 +75,13 @@ __all__ = [
     "InvalidTree",
     "NotALeaf",
     "OrganizationVersionNotFound",
+    "PlateError",
+    "PlateInputError",
     "RootError",
+    "VoucherError",
+    "VoucherHandOffError",
+    "VoucherNotFound",
+    "VoucherConflict",
+    "VoucherVerifyError",
     "WeightError",
 ]

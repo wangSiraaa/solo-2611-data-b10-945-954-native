@@ -32,6 +32,7 @@ from .errors import (
     SchemeError,
     WeightError,
 )
+from .flow_voucher import OccupancyFact
 from .org_service import OrgProduct, OrgService
 
 _SCHEMA = """
@@ -526,6 +527,41 @@ class BudgetService:
                 self._summary_locked(con, sid, product, d)
                 for d in sorted(product.subtree(root_id))
             )
+
+    def occupancy_snapshot(
+        self, scheme_id: Optional[int] = None
+    ) -> tuple[OccupancyFact, ...]:
+        """锁定一次预算实账切面：返回全部承诺在该时刻的占额事实。
+
+        每笔承诺一行（含零占额，由凭单编制方自行过滤），占额口径为
+        “已付 + 仍开立未付”，已付后取消只留下已付；承诺的部门身份与
+        请求号按原始事件读出，迁部不改名、不改挂。快照是一次性整体读取，
+        供流转凭单封存，封存之后预算仓的任何变化都不回写凭单。
+        """
+        with self._connect() as con:
+            sid = scheme_id or self._require_active(con)
+            # 先确认方案存在；占额事实本身按全局事件表重建，与具体方案无关，
+            # 方案 id 只用于锁定“同一次切面”这一编制语义。
+            self._load_scheme(con, sid)
+            rows = con.execute(
+                "SELECT c.request_no, c.dept_id, c.amount, c.status, "
+                "(SELECT COALESCE(SUM(amount), 0) FROM spend s "
+                " WHERE s.request_no = c.request_no) AS spent "
+                "FROM commitment c ORDER BY c.request_no"
+            ).fetchall()
+        facts: list[OccupancyFact] = []
+        for request_no, dept_id, amount, status, spent in rows:
+            spent = int(spent)
+            remaining = (amount - spent) if status == _OPEN else 0
+            facts.append(OccupancyFact(
+                request_no=request_no,
+                dept_id=dept_id,
+                amount=int(amount),
+                status=status,
+                spent=spent,
+                remaining=remaining,
+            ))
+        return tuple(facts)
 
     def open_commitments(self, dept_id: Optional[str] = None) -> tuple[Commitment, ...]:
         sql = (

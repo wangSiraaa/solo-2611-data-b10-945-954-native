@@ -69,3 +69,38 @@ class CommitmentClosedError(BudgetError):
 
 class IdempotencyConflict(BudgetError):
     """同一幂等键被用不同的请求内容重试。"""
+
+
+class VoucherError(BudgetError):
+    """迁编流转凭单体系的错误基类（预算侧产品，沿用预算错误体系）。"""
+
+
+class VoucherHandOffError(VoucherError):
+    """凭单不能交版：存在缺覆盖 / 多归 / 栏头互不为祖先等问题，逐条列出原单。"""
+
+    def __init__(self, problems: "list[tuple[str, str | None, str]] | tuple") -> None:
+        self.problems: tuple[tuple[str, str | None, str], ...] = tuple(problems)
+        detail = "；".join(
+            f"[{code}] {req or '(-)'}: {msg}" for code, req, msg in self.problems
+        )
+        super().__init__(f"凭单不能交版，共 {len(self.problems)} 项问题：{detail}")
+
+
+class VoucherNotFound(VoucherError):
+    """封存凭单号不存在。"""
+
+
+class VoucherConflict(VoucherError):
+    """同号凭单已封存，但本次编制输入与封存内容不一致。"""
+
+
+class VoucherVerifyError(VoucherError):
+    """凭单守恒 / 结构校验失败（封存内容被破坏或载荷被篡改）。"""
+
+
+class PlateError(Exception):
+    """印厂制版体系的错误基类，与组织 / 预算错误体系完全分离。"""
+
+
+class PlateInputError(PlateError):
+    """制版输入非法（引用不存在的栏头、隔墨预算为负、凭单无正带宽等）。"""
